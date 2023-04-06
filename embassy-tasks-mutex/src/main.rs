@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_rp::{clocks::RoscRng, gpio};
 use embassy_time::{Duration, Timer};
@@ -18,6 +19,8 @@ pub enum Activity {
     Eating,
 }
 
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
 static FORK_1: Mutex<ThreadModeRawMutex, ()> = Mutex::new(());
 static FORK_2: Mutex<ThreadModeRawMutex, ()> = Mutex::new(());
 static FORK_3: Mutex<ThreadModeRawMutex, ()> = Mutex::new(());
@@ -25,6 +28,8 @@ static FORK_4: Mutex<ThreadModeRawMutex, ()> = Mutex::new(());
 static FORK_5: Mutex<ThreadModeRawMutex, ()> = Mutex::new(());
 
 static RNG: Mutex<ThreadModeRawMutex, RoscRng> = Mutex::new(RoscRng);
+
+const TIMEOUT: bool = true;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -47,142 +52,98 @@ async fn main(spawner: Spawner) {
     spawner.spawn(philo_5).unwrap();
 
     loop {
-        defmt::trace!("led on!");
-        led.set_high();
-        Timer::after(Duration::from_secs(1)).await;
-
-        defmt::trace!("led off!");
-        led.set_low();
-        Timer::after(Duration::from_secs(1)).await;
+        if RUNNING.load(Ordering::SeqCst) && all_forks_locked() {
+            defmt::println!(
+                "Everybody is hungry but no one can eat. No thinking beyond this point."
+            );
+            RUNNING.store(false, Ordering::SeqCst);
+        }
+        if RUNNING.load(Ordering::SeqCst) {
+            led.set_high();
+        } else {
+            led.set_low();
+        }
+        Timer::after(Duration::from_millis(50)).await;
     }
+}
+
+fn all_forks_locked() -> bool {
+    FORK_1.try_lock().is_err()
+        && FORK_2.try_lock().is_err()
+        && FORK_3.try_lock().is_err()
+        && FORK_4.try_lock().is_err()
+        && FORK_5.try_lock().is_err()
+}
+
+macro_rules! philosopher {
+    ( $f1:expr, $f2:expr, $n:expr, $timeout:expr) => {
+        let mut activity = Activity::default();
+        loop {
+            match activity {
+                Activity::Thinking => {
+                    let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 2);
+                    defmt::println!("Philosopher {} is thinking.", $n);
+                    Timer::after(Duration::from_millis(duration as u64)).await;
+                    activity = Activity::Eating;
+                }
+                Activity::Eating => {
+                    defmt::println!("Philosopher {} is hungry!", $n);
+                    let eat_duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 2);
+                    let wait_duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
+                    let f1 = $f1.lock().await;
+                    let f2 = if !$timeout {
+                        $f2.lock().await
+                    } else {
+                        let f2 = $f2.lock();
+                        let timeout = embassy_time::with_timeout(
+                            Duration::from_millis(wait_duration as u64),
+                            f2,
+                        );
+                        match timeout.await {
+                            Ok(f2) => f2,
+                            Err(_e) => {
+                                defmt::println!(
+                                    "Philosopher {} gives up, goes back to thinking.",
+                                    $n
+                                );
+                                activity = Activity::Thinking;
+                                continue;
+                            }
+                        }
+                    };
+                    RUNNING.store(true, Ordering::SeqCst);
+                    defmt::println!("Philosopher {} is eating!", $n);
+                    Timer::after(Duration::from_millis(eat_duration as u64)).await;
+                    drop(f1);
+                    drop(f2);
+                    activity = Activity::Thinking;
+                }
+            }
+        }
+    };
 }
 
 #[embassy_executor::task]
 async fn philosopher_1() {
-    let mut activity = Activity::default();
-    loop {
-        match activity {
-            Activity::Thinking => {
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                defmt::println!("Philosopher 1 is thinking.");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                activity = Activity::Eating;
-            }
-            Activity::Eating => {
-                defmt::println!("Philosopher 1 is hungry!");
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                let f1 = FORK_1.lock().await;
-                let f2 = FORK_2.lock().await;
-                defmt::println!("Philosopher 1 is eating!");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                drop(f1);
-                drop(f2);
-                activity = Activity::Thinking;
-            }
-        }
-    }
+    philosopher!(FORK_1, FORK_2, 1, TIMEOUT);
 }
 
 #[embassy_executor::task]
 async fn philosopher_2() {
-    let mut activity = Activity::default();
-    loop {
-        match activity {
-            Activity::Thinking => {
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                defmt::println!("Philosopher 2 is thinking.");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                activity = Activity::Eating;
-            }
-            Activity::Eating => {
-                defmt::println!("Philosopher 2 is hungry!");
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                let f2 = FORK_2.lock().await;
-                let f3 = FORK_3.lock().await;
-                defmt::println!("Philosopher 2 is eating!");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                drop(f2);
-                drop(f3);
-                activity = Activity::Thinking;
-            }
-        }
-    }
+    philosopher!(FORK_2, FORK_3, 2, TIMEOUT);
 }
 
 #[embassy_executor::task]
 async fn philosopher_3() {
-    let mut activity = Activity::default();
-    loop {
-        match activity {
-            Activity::Thinking => {
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                defmt::println!("Philosopher 3 is thinking.");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                activity = Activity::Eating;
-            }
-            Activity::Eating => {
-                defmt::println!("Philosopher 3 is hungry!");
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                let f3 = FORK_3.lock().await;
-                let f4 = FORK_4.lock().await;
-                defmt::println!("Philosopher 3 is eating!");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                drop(f3);
-                drop(f4);
-                activity = Activity::Thinking;
-            }
-        }
-    }
+    philosopher!(FORK_3, FORK_4, 3, TIMEOUT);
 }
 
 #[embassy_executor::task]
 async fn philosopher_4() {
-    let mut activity = Activity::default();
-    loop {
-        match activity {
-            Activity::Thinking => {
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                defmt::println!("Philosopher 4 is thinking.");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                activity = Activity::Eating;
-            }
-            Activity::Eating => {
-                defmt::println!("Philosopher 4 is hungry!");
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 32);
-                let f4 = FORK_4.lock().await;
-                let f5 = FORK_5.lock().await;
-                defmt::println!("Philosopher 4 is eating!");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                drop(f4);
-                drop(f5);
-                activity = Activity::Thinking;
-            }
-        }
-    }
+    philosopher!(FORK_4, FORK_5, 4, TIMEOUT);
 }
 
 #[embassy_executor::task]
 async fn philosopher_5() {
-    let mut activity = Activity::default();
-    loop {
-        match activity {
-            Activity::Thinking => {
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 2);
-                defmt::println!("Philosopher 5 is thinking.");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                activity = Activity::Eating;
-            }
-            Activity::Eating => {
-                defmt::println!("Philosopher 5 is hungry!");
-                let duration = RNG.lock().await.next_u32() as u8 / (u8::MAX / 2);
-                let f5 = FORK_5.lock().await;
-                let f1 = FORK_1.lock().await;
-                defmt::println!("Philosopher 5 is eating!");
-                Timer::after(Duration::from_secs(duration as u64)).await;
-                drop(f5);
-                drop(f1);
-                activity = Activity::Thinking;
-            }
-        }
-    }
+    philosopher!(FORK_5, FORK_1, 5, TIMEOUT);
 }
